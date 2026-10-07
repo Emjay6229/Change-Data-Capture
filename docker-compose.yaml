@@ -1,0 +1,120 @@
+name: cdc
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres: the source of truth. Configured so Debezium can read its WAL.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: postgres            # bootstrap superuser, only used by init scripts / admins
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical                # write enough info in WAL to decode row changes
+      - -c
+      - max_replication_slots=10         # one per connector (+ headroom for re-creates)
+      - -c
+      - max_wal_senders=10               # one per streaming connection (connectors + physical replicas)
+      - -c
+      - max_slot_wal_keep_size=2GB       # safety valve: a stalled slot can't fill the disk
+    ports:
+      - "5433:5432"                      # 5432 on host is used by another project
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Kafka: single node, KRaft combined mode (broker + controller). Dev only.
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      CLUSTER_ID: sTh4V7V5Ts6YKNrtX8fQPw          # fixed so it matches the data volume across restarts
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Two client listeners: one for containers, one for apps on your Mac.
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Single node => replication factor 1 for Kafka's internal topics.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics must be created deliberately (by Connect / us), never by a typo.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect with the Debezium connectors pre-installed.
+  # Stores its own state (configs, offsets, statuses) in Kafka topics.
+  # ---------------------------------------------------------------------------
+  connect:
+    image: quay.io/debezium/connect:3.7.0.Final
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: cdc-connect                       # workers with the same id form one Connect cluster
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets      # where Debezium records "how far in the WAL I've published"
+      STATUS_STORAGE_TOPIC: _connect_statuses
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+    ports:
+      - "8083:8083"                               # Connect REST API: we register connectors here
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI: browse topics, messages, consumer groups and connectors.
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+    ports:
+      - "8090:8080"                               # 8080 on host is used by another project
+
+volumes:
+  postgres-data:
+  kafka-data:
